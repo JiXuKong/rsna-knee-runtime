@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pydicom
+from tqdm import tqdm
 
 from runtime.config import (
     FATSAT_OPTS,
@@ -178,35 +179,49 @@ def walk(root: Path, split: str):
             for series in os.scandir(study.path):
                 if series.is_dir():
                     items.append((split, study.name, series.name, series.path))
+    print(f"[walk] {split}: {len(items)} series, probing headers...", flush=True)
     with ThreadPoolExecutor(max_workers=HDR_THREADS) as pool:
-        rows = list(pool.map(probe, items))
+        rows = list(tqdm(
+            pool.map(probe, items), total=len(items),
+            desc=f"DICOM {split}", unit="series", mininterval=1.0,
+        ))
     return pd.DataFrame(rows)
 
 
 def annotate(df):
-    """Recover fat suppression and pulse-sequence weighting from the header."""
+    """从 DICOM 头恢复压脂标志、加权类型，供后面选槽使用。"""
+    # 序列描述 + 序列名拼成一段文本；缺省当空串
     desc = (df["SeriesDescription"].fillna("") + " " + df["SequenceName"].fillna(""))
+    # 转小写，把 _ - . 换成空格，方便正则匹配 t1 / fatsat 等
     desc = desc.str.lower().str.replace(_SEP, " ", regex=True)
 
+    # ScanOptions 是多值，probe() 用 | 拼过；转大写再拆成 token 列表
     opts = df["ScanOptions"].fillna("").str.upper().str.split("|")
-    # GE writes SAT_GEMS for spatial saturation, so ScanOptions must be matched as
-    # exact tokens; a substring test on "SAT" fires on non-fat-sat series.
+    # GE 的 SAT_GEMS 是空间饱和不是压脂；必须整词匹配 FS/FATSAT，不能用 "SAT" 子串
     opts_fs = opts.apply(lambda ts: any(t.strip() in FATSAT_OPTS for t in ts))
+    # 描述里命中 STIR/SPAIR/FS 等，或 ScanOptions 命中压脂 token → fatsat=True
     df["fatsat"] = desc.str.contains(_FATSAT_RX) | opts_fs
 
+    # TR（重复时间，ms）；转不成数字则为 NaN
     tr = pd.to_numeric(df["RepetitionTime"], errors="coerce")
+    # TE（回波时间，ms）
     te = pd.to_numeric(df["EchoTime"], errors="coerce")
+    # ScanningSequence 含 GR → 梯度回波 GRE
     gre = df["ScanningSequence"].fillna("").str.upper().str.contains("GR")
+    # 描述里是否出现 T1 / T2 / PD 字样（三路布尔列）
     t1, t2, pdw = desc.str.contains(_T1_RX), desc.str.contains(_T2_RX), desc.str.contains(_PD_RX)
 
-    df["weight"] = np.where(t1 & ~t2 & ~pdw, "T1",
-                     np.where(t2 & ~pdw, "T2",
-                       np.where(pdw, "PD",
-                         np.where(gre, "GRE",
-                           np.where(tr < 800, "T1",
-                             np.where(te > 60, "T2",
-                               np.where(tr >= 800, "PD", "UNK")))))))
+    # 加权优先级：名字里的 T1 > T2 > PD > GRE；名字没有再靠 TR/TE 猜
+    df["weight"] = np.where(t1 & ~t2 & ~pdw, "T1",          # 只写了 T1
+                     np.where(t2 & ~pdw, "T2",              # 写了 T2（且不是 PD）
+                       np.where(pdw, "PD",                  # 写了 PD / proton
+                         np.where(gre, "GRE",               # 梯度回波
+                           np.where(tr < 800, "T1",         # 短 TR → T1
+                             np.where(te > 60, "T2",        # 长 TE → T2
+                               np.where(tr >= 800, "PD", "UNK")))))))  # 长 TR 当 PD，否则未知
+    # PD/T2 对积液、骨髓水肿敏感，当作「液体序列」去填 FLUID 槽
     df["fluid"] = np.isin(df["weight"], ["PD", "T2"])
+    # 像素间距取第一维（行方向 mm）；后面按 130mm 视野中心裁切要用
     df["px"] = pd.to_numeric(
         df["PixelSpacing"].fillna("").str.split("|").str[0].replace("", np.nan),
         errors="coerce")

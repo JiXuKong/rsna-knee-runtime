@@ -5,9 +5,15 @@ import os
 import re
 from pathlib import Path
 
-# 路径：由 CLI 传入，这里只提供默认值
-DATA_ROOT = Path("data")
-DINOv2_PATH: Path | None = None
+_KAGGLE = Path(os.environ.get("KAGGLE_DIR", "/root/autodl-tmp/kaggle"))
+_REPO = Path(__file__).resolve().parents[1]
+
+DATA_ROOT = _KAGGLE / "data"
+LABELS_PATH = DATA_ROOT / "train_cursor.csv"
+DINOV2_PATH = _KAGGLE / "models" / "dinov2-small"
+SAVE_PATH = _REPO / "outputs" / "model.pt"
+TB_LOG_DIR = _REPO / "outputs" / "tensorboard"
+MODEL_NAME = "dinov2-small"
 
 TARGETS = [
     "ACL",
@@ -27,12 +33,13 @@ TARGETS = [
 SEED = 2026
 CROP_MM = 130.0
 LOAD_IMG = 336
-GROUP = 3
+GROUP = 10
 HDR_THREADS = 16
 
 IMG_SIZE = 224
 LAT_MIN_OFFSET_MM = 20.0
-SLICE_BAND = (0.20, 0.80)
+SLICE_BAND = (0.0, 1.0)
+SLICE_MODE = "center"  # band: SLICE_BAND 内均匀采样；center: 以中间层为中心连续取 GROUP 张
 
 RULES_NATIVE = {
     "order": "normal",
@@ -49,13 +56,29 @@ RULES_LEGACY = {
 RULES = dict(RULES_NATIVE)
 LEGACY_LAT_OFFSET_MM = 5.0
 
-LR_HEAD = 1e-3
+LR_HEAD = 3e-4
 LR_BACKBONE = 8e-6
 UNFREEZE_LAST = 6
 WEIGHT_DECAY = 0.02
 EVAL_BATCH = 8
 EPOCHS = 10
 BATCH_STUDIES = 8
+
+# DataLoader 并行解码参数：DICOM 读取/像素解码在 CPU 上耗时较多
+# 增大 num_workers 通常能显著提升 GPU 利用率。
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", "4"))
+PREFETCH_FACTOR = int(os.environ.get("PREFETCH_FACTOR", "2"))
+PIN_MEMORY = True
+PERSISTENT_WORKERS = True
+
+# batch 级别 train_auc 计算很慢（CPU + sklearn），所以需要降频
+BATCH_AUC_EVERY = int(os.environ.get("BATCH_AUC_EVERY", "50"))
+
+# 图像预处理缓存：True 时 dataset 直接读 .npz，跳过 DICOM 解码
+# 用 scripts/preprocess.py 生成缓存后开启
+USE_IMG_CACHE = 1#os.environ.get("USE_IMG_CACHE", "0") == "1"
+CACHE_DIR = _REPO / "cache"
+IMG_CACHE_DIR = CACHE_DIR / "img"
 
 SLOTS_RECOVERED = [
     ("SAG_FLUID_FS", "Sagittal", True, True),
@@ -110,6 +133,7 @@ _PD_RX = re.compile(r"\bpd\b|\bpdw\b|proton|\bdp\b|dens")
 ORDER_TAGS = [(0x0020, 0x0032), (0x0020, 0x0037), (0x0020, 0x0013)]
 
 HDR_TAGS = [
+    "PatientID",
     "SeriesDescription",
     "SequenceName",
     "ScanOptions",

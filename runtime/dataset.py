@@ -1,10 +1,11 @@
 """PyTorch Dataset — on-demand DICOM loading with torchvision augmentations."""
 from __future__ import annotations
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from runtime.config import GROUP, LOAD_IMG, SLOTS
+from runtime.config import GROUP, IMG_CACHE_DIR, LOAD_IMG, SLOTS, USE_IMG_CACHE
 from runtime.dicom.io import load_study
 from runtime.transforms import train_transform
 
@@ -38,21 +39,25 @@ class KneeStudyDataset(Dataset):
     def __len__(self) -> int:
         return len(self.studies)
 
+    def _load(self, study: str):
+        if USE_IMG_CACHE:
+            p = IMG_CACHE_DIR / f"{study}.npz"
+            if p.exists():
+                d = np.load(p)
+                return torch.from_numpy(d["imgs"]), torch.from_numpy(d["mask"])
+        return load_study(
+            study, self.slot_map, self.lat_map,
+            n_slice=self.n_slices, out_size=self.img_size,
+        )
+
     def __getitem__(self, idx: int) -> dict:
         study = self.studies[idx]
-        imgs, mask = load_study(
-            study,
-            self.slot_map,
-            self.lat_map,
-            n_slice=self.n_slices,
-            out_size=self.img_size,
-        )
-        if self.transform is not None:
-            s, g, h, w = imgs.shape
-            x = imgs.reshape(s * g, h, w).float().div_(255.0)
-            x = self.transform(x)
-            imgs = (x * 255).round().clamp(0, 255).to(torch.uint8).reshape(s, g, h, w)
-
+        imgs, mask = self._load(study)
+        # if self.transform is not None:
+        #     s, g, h, w = imgs.shape
+        #     x = imgs.reshape(s * g, 1, h, w).float().div_(255.0)
+        #     x = self.transform(x)
+        #     imgs = (x * 255).round().clamp(0, 255).to(torch.uint8).reshape(s, g, h, w)
         out = {"imgs": imgs, "mask": mask, "study": study}
         if self.y is not None:
             out["y"] = self.y[idx]

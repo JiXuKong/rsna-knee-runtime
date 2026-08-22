@@ -27,12 +27,10 @@ exec(open("/kaggle/working/submit.py").read())
 
 ## 本地训练
 
+路径改 `runtime/config.py`，然后：
+
 ```bash
-python scripts/train_dino.py \
-  --data-root ./data \
-  --labels ../rsna-knee-labels/derived_labels.csv \
-  --dinov2 /path/to/dinov2-small \
-  --save ./outputs/model.pt
+python scripts/train_dino.py
 ```
 
 ## 结构

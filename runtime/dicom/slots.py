@@ -1,44 +1,35 @@
-"""Choose one series per imaging slot for each study."""
+"""每个检查、每个成像槽只选一条序列。"""
 from __future__ import annotations
 
 import pandas as pd
+from tqdm import tqdm
 
 from runtime.config import RULES, SLOTS
 
 def pick_slots(series_df, plane_map):
-    """One series per slot per study.
+    """每个 study、每个槽只留一条 series。
 
-    Ties are broken toward the stack with the most slices: a thicker stack samples the
-    joint more densely, and the three-slice sampler below benefits from the margin.
+    同一槽有多条候选时取切片数最多的：层更密，后面抽 3 张切片时更不容易贴边。
     """
     series_df = series_df.copy()
     series_df["plane"] = series_df["SeriesInstanceUID"].map(plane_map)
     out = {}
-    for study, g in series_df.groupby("StudyInstanceUID"):
+    for study, g in tqdm(series_df.groupby("StudyInstanceUID")):
         chosen = {}
         for name, plane, fluid, fs in SLOTS:
             sel = (g["plane"] == plane) & (g["fatsat"] == fs)
-            # fluid=None means "do not condition on weighting" - the public scheme,
-            # where the single provided flag stands in for both axes at once.
+            # fluid=None：不按加权筛选（public 方案，一个标志同时代表液体/压脂）
             if fluid is not None:
                 sel &= (g["fluid"] == fluid)
             cand = g[sel]
-            # A slot with no series matching its predicate stays empty, and no substitute
-            # is admitted from a neighbouring predicate. Relaxing the weighting to fill a
-            # T1 slot would draw from the pool `SAG_FLUID_NOFS` selects from, since that
-            # pool is what remains once the weighting is dropped: over the training corpus
-            # it would put one series in two slots for 2383 of 4407 studies and leave 56%
-            # of the T1 slot holding PD or T2. The presence mask would then assert a
-            # sequence that was never acquired, and the per-diagnosis softmax of §6 would
-            # divide its attention across two identical slots, giving one acquisition
-            # about twice the weight it carries in a study that holds both. The mask is
-            # there to say a slot is absent, which is what an absent slot is.
+            # 没有匹配的序列就让槽空着，不拿邻近槽的序列来凑。
+            # 若放宽加权去填 T1 槽，候选会和 SAG_FLUID_NOFS 同一批：训练集里
+            # 2383/4407 个检查会出现同一条序列占两个槽，56% 的 T1 槽实际是 PD/T2。
+            # 存在 mask 会声称拍过 T1，注意力再把同一采集算两次。
+            # mask 的本意就是：没拍到就是缺席。
             if len(cand) == 0 and RULES["slot_fallback"] and fluid is False:
-                # The relaxation the paragraph above rejects, reproduced because an
-                # imported member was fitted with its T1 slots filled this way: over half
-                # of that member's training studies had a T1 slot holding a series that
-                # is not T1. Leaving those slots empty would present it with a presence
-                # mask it never saw.
+                # 上面拒绝的放宽：只为兼容旧权重。那个模型训练时过半 T1 槽
+                # 装的不是 T1；现在若留空，mask 分布会对不上它见过的输入。
                 cand = g[(g["plane"] == plane) & (~g["fatsat"])]
             if len(cand):
                 chosen[name] = cand.sort_values("n_slices", ascending=False).iloc[0]

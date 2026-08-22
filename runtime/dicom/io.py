@@ -9,7 +9,7 @@ import pydicom
 import torch
 import torch.nn.functional as F
 
-from runtime.config import CROP_MM, GROUP, LOAD_IMG, ORDER_TAGS, RULES, SLICE_BAND, SLOTS
+from runtime.config import CROP_MM, GROUP, LOAD_IMG, ORDER_TAGS, RULES, SLICE_BAND, SLICE_MODE, SLOTS
 
 N_SLOT = len(SLOTS)
 DECODE_FAILED: list[str] = []
@@ -107,8 +107,13 @@ def read_slot(rec, n_slice=None, out_size=None):
     if n == 0:
         return None
 
-    lo, hi = int(SLICE_BAND[0] * (n - 1)), int(SLICE_BAND[1] * (n - 1))
-    idx = np.unique(np.linspace(lo, hi, n_slice).astype(int)) if hi > lo else np.array([n // 2])
+    if SLICE_MODE == "center":
+        c = n // 2
+        start = max(0, min(c - n_slice // 2, n - n_slice))
+        idx = np.arange(start, min(start + n_slice, n), dtype=int)
+    else:
+        lo, hi = int(SLICE_BAND[0] * (n - 1)), int(SLICE_BAND[1] * (n - 1))
+        idx = np.unique(np.linspace(lo, hi, n_slice).astype(int)) if hi > lo else np.array([n // 2])
     while len(idx) < n_slice:
         idx = np.append(idx, idx[-1])
 

@@ -1,34 +1,53 @@
 """DINOv2 MIL training."""
 from __future__ import annotations
 
-import argparse
+import random
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from sklearn.model_selection import GroupKFold
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from runtime.config import (
     BATCH_STUDIES,
     DATA_ROOT,
+    DINOV2_PATH,
     EPOCHS,
-    GROUP,
+    IMG_SIZE,
+    LABELS_PATH,
     LOAD_IMG,
     LR_BACKBONE,
     LR_HEAD,
+    MODEL_NAME,
+    SAVE_PATH,
     SEED,
     TARGETS,
+    TB_LOG_DIR,
+    NUM_WORKERS,
+    PREFETCH_FACTOR,
     UNFREEZE_LAST,
+    PIN_MEMORY,
+    PERSISTENT_WORKERS,
     WEIGHT_DECAY,
 )
 from runtime.data_prep import prepare_slot_maps
 from runtime.dataset import KneeStudyDataset, collate_studies
-from runtime.model.mil import MODELS, build_model, macro_auc, predict, save_checkpoint
+from runtime.model.mil import build_model, macro_auc, predict, save_checkpoint
 from runtime.submission import write_submission
 
 LABEL_COLS = TARGETS + [t + "__conf" for t in TARGETS]
+N_FOLDS = 5
+
+
+def _seed_worker(worker_id: int) -> None:
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def load_labels(path: Path) -> pd.DataFrame:
@@ -52,54 +71,20 @@ def build_supervision(st_tr: list[str], train_df: pd.DataFrame, lab: pd.DataFram
         elif st in lab.index:
             row = lab.loc[st]
             y[i] = row[TARGETS].values
-            w[i] = 0.25 + 0.75 * row[[t + "__conf" for t in TARGETS]].values
-    keep = np.where(w.sum(1) > 0)[0]
-    n_val = max(1, len(keep) // 5)
-    tr, va = keep[n_val:], keep[:n_val]
-    return y, w, tr, va
+            w[i] = 0.25 + 0.75 #* row[[t + "__conf" for t in TARGETS]].values
+    return y, w, np.where(w.sum(1) > 0)[0]
 
 
-def train(
-    *,
-    data_root: Path,
-    labels_path: Path,
-    model_name: str,
-    img_size: int,
-    save_path: Path,
-    epochs: int,
-    dinov2_path: Path,
-    unfreeze_last: int,
-) -> None:
-    root = data_root.resolve()
-    data = prepare_slot_maps(root)
-    lab = load_labels(labels_path)
+def _study_ds(studies, data, decode_size, *, idx=None, y=None, w=None, train=False):
+    ids = [studies[i] for i in idx] if idx is not None else studies
+    kw = {}
+    if y is not None:
+        kw["y"] = torch.from_numpy(y[idx])
+        kw["w"] = torch.from_numpy(w[idx])
+    return KneeStudyDataset(ids, data["slots_tr"], data["lat_tr"], img_size=decode_size, train=train, **kw)
 
-    y, w, tr_idx, va_idx = build_supervision(data["st_tr"], data["train_df"], lab)
-    train_studies = [data["st_tr"][i] for i in tr_idx]
-    val_studies = [data["st_tr"][i] for i in va_idx]
-    decode_size = max(img_size, LOAD_IMG)
 
-    train_ds = KneeStudyDataset(
-        train_studies, data["slots_tr"], data["lat_tr"],
-        y=torch.from_numpy(y[tr_idx]), w=torch.from_numpy(w[tr_idx]),
-        img_size=decode_size, train=True,
-    )
-    val_ds = KneeStudyDataset(
-        val_studies, data["slots_tr"], data["lat_tr"],
-        img_size=decode_size, train=False,
-    )
-    test_ds = KneeStudyDataset(
-        data["st_te"], data["slots_te"], data["lat_te"],
-        img_size=decode_size, train=False,
-    )
-    loader = DataLoader(
-        train_ds, batch_size=BATCH_STUDIES, shuffle=True,
-        collate_fn=collate_studies, drop_last=len(train_ds) >= BATCH_STUDIES,
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.manual_seed(SEED)
-    model = build_model(model_name, unfreeze_last=unfreeze_last, dinov2_path=dinov2_path).to(device)
+def train_fold(model, loader, val_ds, y_val, img_size, epochs, device, fold, writer, step):
     opt = torch.optim.AdamW(
         [
             {"params": [p for p in model.backbone.parameters() if p.requires_grad], "lr": LR_BACKBONE},
@@ -107,69 +92,142 @@ def train(
         ],
         weight_decay=WEIGHT_DECAY,
     )
-
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     best_auc, best_state = -1.0, None
-    y_val = (y[va_idx] > 0.5).astype(int)
-
-    for ep in range(epochs):
+    n_batch = max(len(loader), 1)
+    warmup_steps = max(2 * n_batch, 1)
+    sched = torch.optim.lr_scheduler.LinearLR(
+        opt, start_factor=1e-3, end_factor=1.0, total_iters=warmup_steps,
+    )
+    for ep in tqdm(range(epochs), desc=f"fold{fold}", unit="ep"):
         model.train()
-        total = 0.0
-        for batch in loader:
+        ep_loss = 0.0
+        ep_pred, ep_y = [], []
+        pbar = tqdm(loader, desc=f"fold{fold} ep{ep + 1}", leave=False, unit="batch", mininterval=1.0)
+        for bi, batch in enumerate(pbar):
             imgs, mask, yt, wt = (
                 batch["imgs"].to(device), batch["mask"].to(device),
                 batch["y"].to(device), batch["w"].to(device),
             )
             with torch.autocast("cuda", enabled=device.type == "cuda"):
+                logits = model(imgs, mask, img_size)
                 loss = (
-                    F.binary_cross_entropy_with_logits(model(imgs, mask, img_size), yt, reduction="none") * wt
+                    F.binary_cross_entropy_with_logits(logits, yt, reduction="none") * wt
                 ).mean()
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            opt.step()
-            total += loss.item()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
 
-        val_pred = predict(model, val_ds, device, img_size)
-        auc = macro_auc(y_val, val_pred)
-        print(f"epoch {ep + 1}/{epochs}  loss {total / max(len(loader), 1):.4f}  val_auc {auc:.4f}", flush=True)
-        if auc > best_auc:
-            best_auc = auc
+            with torch.no_grad():
+                ep_pred.append(torch.sigmoid(logits).float().cpu())
+                ep_y.append(yt.detach().cpu())
+            lv = loss.item()
+            ep_loss += lv
+
+            pfx = f"fold{fold}"
+            writer.add_scalar(f"{pfx}/batch/loss", lv, step)
+            writer.add_scalar(f"{pfx}/batch/lr_backbone", opt.param_groups[0]["lr"], step)
+            writer.add_scalar(f"{pfx}/batch/lr_head", opt.param_groups[1]["lr"], step)
+            pbar.set_postfix(loss=f"{lv:.4f}")
+            step += 1
+
+        pred = predict(model, val_ds, device, img_size, desc=f"fold{fold} val ep{ep + 1}")
+        val_auc = macro_auc(y_val, pred)
+        y_tr = (torch.cat(ep_y).numpy() > 0.5).astype(int)
+        ep_train_auc = macro_auc(y_tr, torch.cat(ep_pred).numpy())
+        ep_train_loss = ep_loss / n_batch
+        pfx = f"fold{fold}"
+        writer.add_scalar(f"{pfx}/epoch/train_loss", ep_train_loss, ep)
+        writer.add_scalar(f"{pfx}/epoch/train_auc", ep_train_auc, ep)
+        writer.add_scalar(f"{pfx}/epoch/val_auc", val_auc, ep)
+        print(
+            f"epoch {ep + 1}/{epochs}  loss {ep_train_loss:.4f}  "
+            f"train_auc {ep_train_auc:.4f}  val_auc {val_auc:.4f}",
+            flush=True,
+        )
+        if val_auc > best_auc:
+            best_auc = val_auc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
+            writer.add_scalar(f"{pfx}/epoch/best_val_auc", best_auc, ep)
     if best_state is not None:
         model.load_state_dict(best_state)
+    return best_auc, predict(model, val_ds, device, img_size), step
 
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    save_checkpoint(
-        save_path, model, model_name=model_name, img_size=img_size,
-        unfreeze_last=unfreeze_last, dinov2_path=dinov2_path, extra={"val_auc": best_auc},
-    )
 
-    test_pred = predict(model, test_ds, device, img_size)
-    write_submission(test_pred, data["st_te"], data["test_df"], save_path.with_suffix(".submission.csv"))
-    print(f"done  val_auc={best_auc:.4f}  weights={save_path}", flush=True)
+def train() -> None:
+    print("[train] prepare slot maps...", flush=True)
+    data = prepare_slot_maps(DATA_ROOT.resolve())
+    print("[train] load labels...", flush=True)
+    lab = load_labels(LABELS_PATH)
+    y, w, keep = build_supervision(data["st_tr"], data["train_df"], lab)
+    print(f"[train] supervision: {len(keep)} studies with labels", flush=True)
+    decode_size = max(IMG_SIZE, LOAD_IMG)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    test_ds = KneeStudyDataset(data["st_te"], data["slots_te"], data["lat_te"], img_size=decode_size, train=False)
+
+    groups = np.array([data["pid_tr"].get(data["st_tr"][i], data["st_tr"][i]) for i in keep])
+    if len(np.unique(groups)) < N_FOLDS:
+        groups = np.array([data["st_tr"][i] for i in keep])
+    oof = np.zeros_like(y)
+    fold_aucs, test_preds = [], []
+    SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    TB_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    writer = SummaryWriter(TB_LOG_DIR)
+    step = 0
+
+    for fold, (tr, va) in enumerate(GroupKFold(N_FOLDS).split(keep, groups=groups)):
+        tr_idx, va_idx = keep[tr], keep[va]
+        print(f"\nfold {fold + 1}/{N_FOLDS}  train {len(tr_idx)}  val {len(va_idx)}", flush=True)
+        torch.manual_seed(SEED + fold)
+        train_ds = _study_ds(data["st_tr"], data, decode_size, idx=tr_idx, y=y, w=w, train=True)
+        val_ds = _study_ds(data["st_tr"], data, decode_size, idx=va_idx)
+        g = torch.Generator()
+        g.manual_seed(SEED + fold)
+        loader = DataLoader(
+            train_ds, batch_size=BATCH_STUDIES, shuffle=True,
+            collate_fn=collate_studies, drop_last=len(train_ds) >= BATCH_STUDIES,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY and device.type == "cuda",
+            persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+            prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+            worker_init_fn=_seed_worker if NUM_WORKERS > 0 else None,
+            generator=g,
+        )
+        model = build_model(MODEL_NAME, unfreeze_last=UNFREEZE_LAST, dinov2_path=DINOV2_PATH).to(device)
+        auc, pred, step = train_fold(
+            model, loader, val_ds, (y[va_idx] > 0.5).astype(int), IMG_SIZE, EPOCHS, device, fold, writer, step,
+        )
+        oof[va_idx] = pred
+        fold_aucs.append(auc)
+        writer.add_scalar("summary/fold_val_auc", auc, fold)
+        fold_path = SAVE_PATH.with_name(f"{SAVE_PATH.stem}_fold{fold}{SAVE_PATH.suffix}")
+        save_checkpoint(
+            fold_path, model, model_name=MODEL_NAME, img_size=IMG_SIZE,
+            unfreeze_last=UNFREEZE_LAST, dinov2_path=DINOV2_PATH, extra={"val_auc": auc, "fold": fold},
+        )
+        # test_preds.append(predict(model, test_ds, device, IMG_SIZE, desc=f"fold{fold} test"))
+        print(f"fold {fold + 1} auc={auc:.4f}  weights={fold_path}", flush=True)
+
+    y_bin = (y[keep] > 0.5).astype(int)
+    oof_auc = macro_auc(y_bin, oof[keep])
+    mean_auc = float(np.mean(fold_aucs))
+    for i, a in enumerate(fold_aucs):
+        print(f"fold {i + 1} auc={a:.4f}")
+        writer.add_scalar("summary/fold_val_auc_final", a, i)
+    writer.add_scalar("summary/mean_val_auc", mean_auc, 0)
+    writer.add_scalar("summary/oof_auc", oof_auc, 0)
+    writer.close()
+    print(f"mean auc={mean_auc:.4f}  oof auc={oof_auc:.4f}", flush=True)
+    print(f"tensorboard logdir={TB_LOG_DIR}", flush=True)
+
+    # write_submission(np.mean(test_preds, 0), data["st_te"], data["test_df"], SAVE_PATH.with_suffix(".submission.csv"))
+    print(f"done  mean_auc={mean_auc:.4f}  oof_auc={oof_auc:.4f}", flush=True)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Train DINOv2 MIL")
-    p.add_argument("--data-root", type=Path, default=DATA_ROOT, help="竞赛数据目录")
-    p.add_argument("--labels", type=Path, required=True, help="derived_labels.csv")
-    p.add_argument("--model", default="dinov2-small", choices=list(MODELS))
-    p.add_argument("--img-size", type=int, default=224)
-    p.add_argument("--save", type=Path, default=Path("outputs/model.pt"))
-    p.add_argument("--epochs", type=int, default=EPOCHS)
-    p.add_argument("--dinov2", type=Path, required=True, help="DINOv2 权重目录")
-    p.add_argument("--unfreeze-last", type=int, default=UNFREEZE_LAST)
-    args = p.parse_args()
-    train(
-        data_root=args.data_root,
-        labels_path=args.labels,
-        model_name=args.model,
-        img_size=args.img_size,
-        save_path=args.save,
-        epochs=args.epochs,
-        dinov2_path=args.dinov2,
-        unfreeze_last=args.unfreeze_last,
-    )
+    train()
 
 
 if __name__ == "__main__":

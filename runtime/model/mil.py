@@ -12,6 +12,10 @@ from torch.utils.data import DataLoader
 from runtime.config import (
     EVAL_BATCH,
     POOL_PARTS,
+    NUM_WORKERS,
+    PREFETCH_FACTOR,
+    PIN_MEMORY,
+    PERSISTENT_WORKERS,
     SLOTS,
     SLOT_PRIOR_STRENGTH,
     SLOT_PRIOR_TABLE,
@@ -58,28 +62,66 @@ class SlotHead(nn.Module):
         return (ctx * self.out.weight.unsqueeze(0)).sum(-1) + self.out.bias
 
 
+class MeanHead(nn.Module):
+    def __init__(self, dim, n_slot, n_out, hidden=256, p=0.2, prior=False):
+        super().__init__()
+        self.proj = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden), nn.GELU())
+        self.slot_emb = nn.Parameter(torch.randn(n_slot, hidden) * 0.02)
+        self.drop = nn.Dropout(p)
+        self.out = nn.Linear(hidden, n_out)
+
+    def forward(self, x, mask):
+        h = self.proj(x) + self.slot_emb
+        w = mask.unsqueeze(-1).clamp(min=0)
+        mean = (h * w).sum(1) / w.sum(1).clamp_min(1e-6)
+        # mx = h.masked_fill(w < 0.5, -1e4).max(1).values
+        return self.out(self.drop(mean))
+
+
 class Model(nn.Module):
     def __init__(self, backbone, dim, pool="cls_mean", prior=False):
         super().__init__()
         self.backbone = backbone
         self.pool = pool
-        self.head = SlotHead(dim * POOL_PARTS[pool], N_SLOT, len(TARGETS), prior=prior)
-        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
-        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+        # self.head = SlotHead(dim * POOL_PARTS[pool], N_SLOT, len(TARGETS), prior=prior)
+        self.head = MeanHead(dim * POOL_PARTS[pool], N_SLOT, len(TARGETS), prior=prior)
+        # GROUP==3：三切片叠成 RGB；否则每张切片复制为 3 通道，特征在切片维平均
+        self.register_buffer("mean3", torch.tensor([0.485, 0.456, 0.406]))
+        self.register_buffer("std3", torch.tensor([0.229, 0.224, 0.225]))
 
     def forward(self, imgs, mask, img_size=None):
-        b, s = imgs.shape[:2]
-        x = imgs.reshape(b * s, *imgs.shape[2:]).float().div_(255.0)
-        if img_size is not None and img_size != x.shape[-1]:
-            x = F.interpolate(x, size=(img_size, img_size), mode="bilinear", align_corners=False)
-        x = (x - self.mean) / self.std
+        b, s, g, h, w = imgs.shape
+        x = imgs.float().div_(255.0)
+        if img_size is not None and img_size != h:
+            x = F.interpolate(
+                x.reshape(b * s * g, 1, h, w),
+                size=(img_size, img_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            h = w = img_size
+        else:
+            x = x.reshape(b * s * g, 1, h, w)
+
+        if g == 3:
+            x = x.reshape(b * s, 3, h, w)
+        else:
+            x = x.repeat(1, 3, 1, 1)
+
+        mean = self.mean3.view(1, 3, 1, 1)
+        std = self.std3.view(1, 3, 1, 1)
+        x = (x - mean) / std
         out = self.backbone(pixel_values=x).last_hidden_state
         patch = out[:, 1:]
         parts = [out[:, 0], patch.mean(1)]
         if self.pool == "cls_mean_focal":
             k = max(1, patch.shape[1] // 8)
             parts.append(patch.topk(k, dim=1).values.mean(1))
-        feat = torch.cat(parts, dim=1).reshape(b, s, -1)
+        feat = torch.cat(parts, dim=1)
+        if g == 3:
+            feat = feat.reshape(b, s, -1)
+        else:
+            feat = feat.reshape(b, s, g, -1).mean(2)
         return self.head(feat, mask)
 
 
@@ -164,11 +206,22 @@ def load_model(
 
 
 @torch.no_grad()
-def predict(model: Model, dataset, device: torch.device, img_size: int | None = None) -> np.ndarray:
+def predict(model: Model, dataset, device: torch.device, img_size: int | None = None, desc: str = "predict") -> np.ndarray:
+    from tqdm import tqdm
+
     model.eval()
-    loader = DataLoader(dataset, batch_size=EVAL_BATCH, shuffle=False, collate_fn=collate_studies)
+    loader = DataLoader(
+        dataset,
+        batch_size=EVAL_BATCH,
+        shuffle=False,
+        collate_fn=collate_studies,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY and device.type == "cuda",
+        persistent_workers=PERSISTENT_WORKERS and NUM_WORKERS > 0,
+        prefetch_factor=PREFETCH_FACTOR if NUM_WORKERS > 0 else None,
+    )
     out = []
-    for batch in loader:
+    for batch in tqdm(loader, desc=desc, unit="batch", leave=False, mininterval=1.0):
         imgs = batch["imgs"].to(device)
         mask = batch["mask"].to(device)
         with torch.autocast("cuda", enabled=device.type == "cuda"):
